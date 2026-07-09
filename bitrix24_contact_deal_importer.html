@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<title>Bitrix24 Contact+Deal Bulk Importer</title>
+<script src="https://api.bitrix24.com/api/v1/"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f5f6f8;color:#222}
+h2{color:#2FC6F6}
+.card{background:#fff;padding:16px 20px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1);margin-bottom:16px}
+label{font-weight:bold;display:block;margin:8px 0 4px}
+select,input[type=file],input[type=radio]{margin-right:6px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
+th{background:#eef7fc}
+button{background:#2FC6F6;color:#fff;border:none;padding:10px 18px;border-radius:6px;cursor:pointer;font-size:14px}
+button:disabled{background:#aaa;cursor:not-allowed}
+.status{font-size:13px;color:#555;margin-top:8px;white-space:pre-wrap;max-height:220px;overflow:auto;background:#111;color:#0f0;padding:10px;border-radius:6px}
+.pill{display:inline-block;background:#eef7fc;border-radius:4px;padding:2px 8px;margin:2px;font-size:12px}
+</style>
+</head>
+<body>
+<h2>Contact + Deal Bulk Importer (Excel → Bitrix24)</h2>
+
+<div class="card">
+  <label>Step 1: Excel file chunein (.xlsx / .xls / .csv)</label>
+  <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+</div>
+
+<div class="card">
+  <label>Step 2: Duplicate check kaise karein?</label>
+  <input type="radio" name="dupMode" value="PHONE" checked> Mobile se
+  <input type="radio" name="dupMode" value="EMAIL"> Email se
+  <input type="radio" name="dupMode" value="BOTH"> Dono se (Mobile ya Email match)
+</div>
+
+<div class="card">
+  <label>Step 3: Deal Pipeline aur Stage chunein</label>
+  <select id="pipelineSelect"><option>-- Loading pipelines... --</option></select>
+  <select id="stageSelect"><option>-- Pehle pipeline chunein --</option></select>
+</div>
+
+<div class="card">
+  <label>Step 4: Field Mapping (auto-detect + manual override)</label>
+  <div id="mappingTableWrap"><i>Excel file upload karne ke baad yahan mapping table aayegi...</i></div>
+</div>
+
+<div class="card">
+  <button id="importBtn" disabled>Import Start Karein</button>
+  <div class="status" id="statusLog">Ready. Pehle Excel file upload karein.</div>
+</div>
+
+<script>
+let contactFields = {}, dealFields = {}, excelRows = [], excelHeaders = [];
+let dealCategories = [], dealStagesByCat = {};
+let fieldMap = {}; // excelHeader -> {entity:'contact'/'deal', code:'FIELD_CODE', enumMap:{excelValue:ID}}
+
+function log(msg){
+  const el = document.getElementById('statusLog');
+  el.textContent += "\n" + msg;
+  el.scrollTop = el.scrollHeight;
+}
+
+function normalize(str){
+  return (str||'').toString().toLowerCase().replace(/[^a-z0-9а-я\u0900-\u097F]/gi,'').trim();
+}
+
+// ---- INIT: auto-fetch auth (BX24 handles this automatically inside Bitrix24 iframe) ----
+BX24.init(function(){
+  log("BX24 SDK initialised. Auth token auto-fetched by Bitrix24 (no manual API key needed).");
+  loadFieldsAndPipelines();
+});
+
+function loadFieldsAndPipelines(){
+  BX24.callMethod('crm.contact.fields', {}, function(res){
+    contactFields = res.data();
+    log("Contact fields loaded: " + Object.keys(contactFields).length);
+  });
+  BX24.callMethod('crm.deal.fields', {}, function(res){
+    dealFields = res.data();
+    log("Deal fields loaded: " + Object.keys(dealFields).length);
+  });
+  BX24.callMethod('crm.dealcategory.list', {}, function(res){
+    dealCategories = res.data();
+    const sel = document.getElementById('pipelineSelect');
+    sel.innerHTML = '<option value="0">Default pipeline</option>' +
+      dealCategories.map(c=>`<option value="${c.ID}">${c.NAME}</option>`).join('');
+    loadStages(sel.value);
+    sel.onchange = ()=> loadStages(sel.value);
+  });
+}
+
+function loadStages(categoryId){
+  const entityId = categoryId==0 ? 'DEAL_STAGE' : 'DEAL_STAGE_'+categoryId;
+  BX24.callMethod('crm.status.list', {filter:{ENTITY_ID:entityId}}, function(res){
+    dealStagesByCat[categoryId] = res.data();
+    const sel = document.getElementById('stageSelect');
+    sel.innerHTML = res.data().map(s=>`<option value="${s.STATUS_ID}">${s.NAME}</option>`).join('');
+  });
+}
+
+// ---- EXCEL UPLOAD ----
+document.getElementById('fileInput').addEventListener('change', function(e){
+  const file = e.target.files[0];
+  const reader = new FileReader();
+  reader.onload = function(evt){
+    const wb = XLSX.read(evt.target.result, {type:'binary'});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, {defval:''});
+    excelRows = rows;
+    excelHeaders = Object.keys(rows[0]||{});
+    log("Excel loaded: " + rows.length + " rows, headers: " + excelHeaders.join(', '));
+    autoMapFields();
+  };
+  reader.readAsBinaryString(file);
+});
+
+// ---- AUTO FIELD DETECTION ----
+function autoMapFields(){
+  fieldMap = {};
+  excelHeaders.forEach(h=>{
+    const normH = normalize(h);
+    let best = findBestFieldMatch(normH, contactFields, 'contact') ||
+               findBestFieldMatch(normH, dealFields, 'deal');
+    fieldMap[h] = best || {entity:'', code:'', enumMap:{}};
+    if(best && best.enumItems){
+      fieldMap[h].enumMap = buildEnumMap(excelRows, h, best.enumItems);
+    }
+  });
+  renderMappingTable();
+}
+
+function findBestFieldMatch(normH, fields, entity){
+  for(const code in fields){
+    const f = fields[code];
+    const title = normalize(f.title || f.formLabel || code);
+    if(title === normH || normalize(code) === normH){
+      return {entity, code, enumItems: f.items || null, title: f.title||code};
+    }
+  }
+  // loose contains match
+  for(const code in fields){
+    const f = fields[code];
+    const title = normalize(f.title || f.formLabel || code);
+    if(title && (title.includes(normH) || normH.includes(title)) && normH.length>2){
+      return {entity, code, enumItems: f.items || null, title: f.title||code};
+    }
+  }
+  return null;
+}
+
+function buildEnumMap(rows, header, items){
+  const map = {};
+  const seen = new Set(rows.map(r=>String(r[header]||'').trim()).filter(v=>v));
+  seen.forEach(val=>{
+    const nv = normalize(val);
+    const match = items.find(it => normalize(it.VALUE) === nv) ||
+                  items.find(it => normalize(it.VALUE).includes(nv) || nv.includes(normalize(it.VALUE)));
+    map[val] = match ? match.ID : '';
+  });
+  return map;
+}
+
+function fieldOptionsHtml(selectedEntity, selectedCode){
+  let opts = '<option value="">-- Skip --</option>';
+  opts += `<optgroup label="Contact fields">` + Object.keys(contactFields).map(c=>
+    `<option value="contact::${c}" ${selectedEntity==='contact'&&selectedCode===c?'selected':''}>${contactFields[c].title||c}</option>`).join('') + `</optgroup>`;
+  opts += `<optgroup label="Deal fields">` + Object.keys(dealFields).map(c=>
+    `<option value="deal::${c}" ${selectedEntity==='deal'&&selectedCode===c?'selected':''}>${dealFields[c].title||c}</option>`).join('') + `</optgroup>`;
+  return opts;
+}
+
+function renderMappingTable(){
+  let rowsHtml = excelHeaders.map(h=>{
+    const m = fieldMap[h];
+    const enumInfo = m.enumMap && Object.keys(m.enumMap).length
+      ? Object.entries(m.enumMap).map(([k,v])=>`<span class="pill">${k} → ID:${v||'?'}</span>`).join('')
+      : '';
+    return `<tr>
+      <td>${h}</td>
+      <td><select data-header="${h}" class="mapSel" onchange="updateMap(this)">${fieldOptionsHtml(m.entity, m.code)}</select></td>
+      <td>${enumInfo}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('mappingTableWrap').innerHTML =
+    `<table><tr><th>Excel Column</th><th>Bitrix Field (auto-detected, editable)</th><th>Dropdown Value Mapping</th></tr>${rowsHtml}</table>`;
+  document.getElementById('importBtn').disabled = false;
+}
+
+function updateMap(sel){
+  const header = sel.getAttribute('data-header');
+  const [entity, code] = sel.value.split('::');
+  const fields = entity==='contact'?contactFields:dealFields;
+  const f = fields ? fields[code] : null;
+  fieldMap[header] = {entity: entity||'', code: code||'', enumItems: f?f.items:null, enumMap:{}};
+  if(f && f.items){
+    fieldMap[header].enumMap = buildEnumMap(excelRows, header, f.items);
+  }
+  renderMappingTable();
+}
+
+// ---- IMPORT ----
+document.getElementById('importBtn').addEventListener('click', runImport);
+
+function getDupMode(){
+  return document.querySelector('input[name=dupMode]:checked').value;
+}
+
+function runImport(){
+  document.getElementById('importBtn').disabled = true;
+  const dupMode = getDupMode();
+  const categoryId = document.getElementById('pipelineSelect').value;
+  const stageId = document.getElementById('stageSelect').value;
+  log("Import shuru: dupMode=" + dupMode + ", category=" + categoryId + ", stage=" + stageId);
+  processRow(0, dupMode, categoryId, stageId);
+}
+
+function processRow(i, dupMode, categoryId, stageId){
+  if(i >= excelRows.length){ log("✅ Import complete: " + excelRows.length + " rows processed."); return; }
+  const row = excelRows[i];
+  const contactData = {}; const dealData = {};
+  excelHeaders.forEach(h=>{
+    const m = fieldMap[h];
+    if(!m || !m.code) return;
+    let val = row[h];
+    if(m.enumMap && Object.keys(m.enumMap).length){ val = m.enumMap[String(val).trim()] || ''; }
+    if(m.entity==='contact') contactData[m.code] = val;
+    else if(m.entity==='deal') dealData[m.code] = val;
+  });
+
+  const phone = contactData['PHONE'] ? [{VALUE:contactData['PHONE'], VALUE_TYPE:'WORK'}] : null;
+  const email = contactData['EMAIL'] ? [{VALUE:contactData['EMAIL'], VALUE_TYPE:'WORK'}] : null;
+
+  checkDuplicate(dupMode, contactData['PHONE'], contactData['EMAIL'], function(existingId){
+    if(existingId){
+      log(`Row ${i+1}: Duplicate mila (Contact ID ${existingId}), naya contact skip, deal banayenge.`);
+      createDeal(existingId, dealData, categoryId, stageId, ()=>processRow(i+1, dupMode, categoryId, stageId));
+    } else {
+      const payload = Object.assign({}, contactData);
+      if(phone) payload.PHONE = phone;
+      if(email) payload.EMAIL = email;
+      BX24.callMethod('crm.contact.add', {fields: payload}, function(res){
+        if(res.error()){ log(`Row ${i+1}: Contact error - ${res.error()}`); processRow(i+1, dupMode, categoryId, stageId); return; }
+        const newId = res.data();
+        log(`Row ${i+1}: Contact create hua (ID ${newId}).`);
+        createDeal(newId, dealData, categoryId, stageId, ()=>processRow(i+1, dupMode, categoryId, stageId));
+      });
+    }
+  });
+}
+
+function checkDuplicate(dupMode, phone, email, cb){
+  const filters = [];
+  if((dupMode==='PHONE'||dupMode==='BOTH') && phone) filters.push({PHONE: phone});
+  if((dupMode==='EMAIL'||dupMode==='BOTH') && email) filters.push({EMAIL: email});
+  if(filters.length===0) return cb(null);
+  let idx=0, found=null;
+  function next(){
+    if(idx>=filters.length) return cb(found);
+    BX24.callMethod('crm.contact.list', {filter: filters[idx], select:['ID']}, function(res){
+      const data = res.data();
+      if(data && data.length){ found = data[0].ID; return cb(found); }
+      idx++; next();
+    });
+  }
+  next();
+}
+
+function createDeal(contactId, dealData, categoryId, stageId, cb){
+  const fields = Object.assign({CONTACT_ID: contactId, CATEGORY_ID: categoryId, STAGE_ID: stageId}, dealData);
+  BX24.callMethod('crm.deal.add', {fields}, function(res){
+    if(res.error()) log("Deal error: " + res.error());
+    else log("  → Deal created (ID " + res.data() + ")");
+    cb();
+  });
+}
+</script>
+</body>
+</html>
